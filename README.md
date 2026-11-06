@@ -26,6 +26,26 @@ cd unifi-cleanup
 sudo bash scripts/unifi-cleanup.sh --install
 ```
 
+### Доставка в изолированную сеть
+
+На узле с доступом к исходникам подготовьте отдельный архив `unifi-cleanup.tar.gz` и передайте его на контроллер через SSH. Для этого способа нужны `scp`, `tar` и `sha256sum`. Замените `ADMIN`, `STAGING_HOST`, путь к архиву и ожидаемый SHA-256 значениями своей поставки. Контрольную сумму получите по доверенному каналу перед установкой.
+
+```bash
+(
+set -e
+unifi_cleanup_tmp=$(mktemp -d /tmp/unifi-cleanup-src.XXXXXX)
+scp ADMIN@STAGING_HOST:/path/to/unifi-cleanup.tar.gz "$unifi_cleanup_tmp/source.tar.gz"
+expected_sha256='REPLACE_WITH_TRUSTED_SHA256'
+printf '%s  %s\n' "$expected_sha256" "$unifi_cleanup_tmp/source.tar.gz" | sha256sum -c -
+tar -xzf "$unifi_cleanup_tmp/source.tar.gz" -C "$unifi_cleanup_tmp"
+sudo bash "$unifi_cleanup_tmp/unifi-cleanup/scripts/unifi-cleanup.sh" --install
+)
+```
+
+У подготовленного отдельного архива корневой каталог `unifi-cleanup/`. У архивов, скачанных непосредственно с GitHub, имя корневого каталога содержит ветку или хеш коммита. Путь к установщику должен соответствовать содержимому выбранного архива.
+
+В изолированной сети зависимости устанавливаются заранее. После доставки комплект работает с локальными API UniFi и MongoDB. Доставка почты использует настроенный почтовый сервис.
+
 Установщик выполняет следующие шаги.
 
 1. Сохраняет прежние служебные файлы и root-crontab в закрытом `/var/backups/unifi-cleanup/`.
@@ -64,7 +84,13 @@ sudo /opt/unifi-cleanup.sh --apply
 | `--index-only` | Ожидание готовности и план | Восстановление реестра | — | — |
 | `--apply` | Автоматическое повышение меньших пределов | Восстановление реестра | Удаление ограниченными партиями | При настроенном получателе |
 
-Рабочее задание cron запускается каждое воскресенье в **03:00 по системному времени сервера**. Для сервера в UTC это 06:00 МСК.
+Рабочее задание cron запускается каждое воскресенье в **03:00 по системному времени сервера**. Для запуска в 03:00 МСК используйте системную зону `Europe/Moscow`. На узле со службой `cron` её можно применить и проверить следующими командами.
+
+```bash
+sudo timedatectl set-timezone Europe/Moscow
+sudo systemctl restart cron
+timedatectl show -p Timezone --value
+```
 
 ```cron
 0 3 * * 0 /opt/unifi-cleanup.sh --apply >> /var/log/unifi-cleanup.log 2>&1
