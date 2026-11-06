@@ -90,9 +90,9 @@ function cleanupCaseMatches(document, query) {
 function cleanupCaseConfig(mode, overrides) {
     var config = {mode: mode, batchSize: 2, maxPerCollection: 100, maxTotal: 100, javaHeapBytes: 4294967296,
         maxSeconds: 600, maxTimeMS: 5000, retention: {
-            user: 455, reference_name_history: 455, rogue: 90, stat_5minutes: 30,
-            stat_hourly: 90, stat_daily: 455, stat_monthly: 455, stat_archive: 455,
-            wifi_connection_event: 455
+            user: {years: 1}, reference_name_history: {years: 1}, rogue: {days: 90},
+            stat_daily: {years: 1}, stat_monthly: {years: 1}, stat_archive: {years: 1},
+            wifi_connection_event: {years: 1}
         }};
     Object.keys(overrides || {}).forEach(function(key) { config[key] = overrides[key]; });
     return config;
@@ -151,6 +151,9 @@ function cleanupCaseEnvironment(data, options) {
         };
     }
     function collection(name) {
+        if ((options.forbiddenCollections || []).indexOf(name) >= 0) {
+            throw new Error("Unexpected access to " + name);
+        }
         if (!data[name]) { data[name] = []; }
         return {
             find: function(query, projection) {
@@ -225,6 +228,101 @@ function cleanupCaseEnvironment(data, options) {
     print = function(line) { state.logs.push(String(line)); };
     return state;
 }
+
+cleanupCaseTest("year retention uses 365 days per year", function() {
+    var now = new Date("2026-11-06T12:34:56.789Z").getTime();
+    cleanupCaseAssert(cleanupRetentionCutoff(now, {years: 3}) === now - 1095 * 86400000,
+        "three years did not use 1095 days");
+    cleanupCaseAssert(cleanupRetentionCutoff(now, {years: 1}) === now - 365 * 86400000,
+        "one year did not use 365 days");
+});
+
+cleanupCaseTest("retention cutoff keeps the boundary in every supported time representation", function() {
+    var cutoff = cleanupRetentionCutoff(new Date("2026-11-06T12:00:00.000Z").getTime(), {years: 3});
+    var query = cleanupTimeQuery("time", cutoff);
+    [
+        [cutoff - 1, cutoff, cutoff + 1],
+        [Math.floor(cutoff / 1000) - 1, Math.floor(cutoff / 1000), Math.floor(cutoff / 1000) + 1],
+        [new Date(cutoff - 1), new Date(cutoff), new Date(cutoff + 1)]
+    ].forEach(function(values) {
+        cleanupCaseAssert(cleanupCaseMatches({time: values[0]}, query), "expired record was retained");
+        cleanupCaseAssert(!cleanupCaseMatches({time: values[1]}, query), "boundary record was removed");
+        cleanupCaseAssert(!cleanupCaseMatches({time: values[2]}, query), "recent record was removed");
+    });
+});
+
+cleanupCaseTest("three-year cleanup uses a 1095-day window", function() {
+    var config = cleanupCaseConfig("apply");
+    config.retention.user = {years: 3};
+    var cutoff = cleanupRetentionCutoff(cleanupCaseNow, {years: 3});
+    var state = cleanupCaseEnvironment(cleanupCaseFixture([
+        cleanupCaseUser(1, {last_seen: cutoff - 86400000}),
+        cleanupCaseUser(2, {last_seen: cleanupCaseNow - 1001 * 86400000})
+    ]));
+    cleanupCaseAssert(runUniFiCleanup(config) === "OK", "three-year cleanup failed");
+    cleanupCaseAssert(state.data["ace.user"].length === 1 && state.data["ace.user"][0]._id === 2,
+        "three-year retention used a shorter day interval");
+    cleanupCaseAssert(state.logs.some(function(line) {
+        return line.indexOf("ace.user: удалено=1, хранение=3 года,") === 0;
+    }), "report did not use years");
+});
+
+[3, {years: 0}, {years: 3, days: 1095}, {months: 36}, {years: 11}, {days: 3651}].forEach(function(policy, number) {
+    cleanupCaseTest("invalid retention policy " + number + " prevents data access", function() {
+        var config = cleanupCaseConfig("apply");
+        config.retention.user = policy;
+        var state = cleanupCaseEnvironment(cleanupCaseFixture([cleanupCaseUser(1)]), {onlyIndexes: true});
+        var failed = false;
+        try { runUniFiCleanup(config); } catch (error) {
+            failed = error.message.indexOf("Неверный срок хранения user") === 0;
+        }
+        cleanupCaseAssert(failed && state.deletes.length === 0 && state.statsCalls === 0,
+            "invalid policy reached database operations");
+    });
+});
+
+cleanupCaseTest("rogue retention uses days", function() {
+    var config = cleanupCaseConfig("apply");
+    config.retention.rogue = {years: 3};
+    var state = cleanupCaseEnvironment(cleanupCaseFixture(), {onlyIndexes: true});
+    var failed = false;
+    try { runUniFiCleanup(config); } catch (error) {
+        failed = error.message.indexOf("Неверный срок хранения rogue") === 0;
+    }
+    cleanupCaseAssert(failed && state.statsCalls === 0, "rogue accepted an unexpected retention unit");
+});
+
+cleanupCaseTest("explicit historical day retention remains supported", function() {
+    var config = cleanupCaseConfig("apply");
+    config.retention.user = {days: 730};
+    var state = cleanupCaseEnvironment(cleanupCaseFixture([
+        cleanupCaseUser(1, {last_seen: cleanupCaseNow - 731 * 86400000}), cleanupCaseUser(2)
+    ]));
+    cleanupCaseAssert(runUniFiCleanup(config) === "OK", "custom day retention failed");
+    cleanupCaseAssert(state.data["ace.user"].length === 1 && state.data["ace.user"][0]._id === 2,
+        "custom day interval changed");
+});
+
+["dry-run", "apply", "index-only"].forEach(function(mode) {
+    cleanupCaseTest("short statistics remain untouched in " + mode + " with legacy overrides", function() {
+        var data = cleanupCaseFixture();
+        var excluded = ["ace_stat.stat_5minutes", "ace_stat.stat_hourly"];
+        excluded.forEach(function(name) {
+            data[name] = [{_id: name, site_id: "s1", datetime: new Date(cleanupCaseOld), time: cleanupCaseOld}];
+        });
+        var state = cleanupCaseEnvironment(data, {forbiddenCollections: excluded});
+        var config = cleanupCaseConfig(mode);
+        config.retention.stat_5minutes = 1;
+        config.retention.stat_hourly = 1;
+        var expected = mode === "dry-run" ? "DRY_RUN" : mode === "apply" ? "OK" : "INDEX_OK";
+        cleanupCaseAssert(runUniFiCleanup(config) === expected, "excluded collection was accessed");
+        excluded.forEach(function(name) {
+            cleanupCaseAssert(state.data[name].length === 1, "short statistics record was removed");
+            cleanupCaseAssert(!state.logs.some(function(line) { return line.indexOf(name) >= 0; }),
+                "excluded collection appeared in cleanup report");
+        });
+    });
+});
 
 cleanupCaseTest("mixed time units and non-time sentinels", function() {
     var rows = [cleanupCaseUser(1, {last_seen: Math.floor(cleanupCaseOld / 1000)}),

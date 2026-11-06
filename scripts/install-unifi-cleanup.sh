@@ -156,13 +156,57 @@ if not config_path.exists():
     config.extend([
         "MONGO_HOST=127.0.0.1", "MONGO_PORT=27117", "BATCH_SIZE=500",
         "MAX_PER_COLLECTION=10000", "MAX_TOTAL=50000", "MAX_RUNTIME_SEC=600",
-        "QUERY_TIMEOUT_MS=5000", "KEEP_USER_DAYS=1000", "KEEP_REFERENCE_DAYS=1000",
-        "KEEP_ROGUE_DAYS=180", "KEEP_5MIN_DAYS=60", "KEEP_HOURLY_DAYS=180",
-        "KEEP_DAILY_DAYS=1000", "KEEP_MONTHLY_DAYS=1000", "KEEP_ARCHIVE_DAYS=1000",
-        "KEEP_WIFI_DAYS=1000",
+        "QUERY_TIMEOUT_MS=5000", "KEEP_USER_YEARS=3", "KEEP_REFERENCE_YEARS=3",
+        "KEEP_ROGUE_DAYS=180", "KEEP_DAILY_YEARS=3", "KEEP_MONTHLY_YEARS=3",
+        "KEEP_ARCHIVE_YEARS=3", "KEEP_WIFI_YEARS=3",
     ])
     config_path.write_text("\n".join(config) + "\n")
     config_path.chmod(0o600)
+else:
+    # Migrate literal defaults without executing the administrator's configuration.
+    original = config_path.read_text()
+    lines = original.splitlines(keepends=True)
+    old_keys = {"KEEP_" + name + "_DAYS": "KEEP_" + name + "_YEARS"
+                for name in ("USER", "REFERENCE", "DAILY", "MONTHLY", "ARCHIVE", "WIFI")}
+    obsolete = {"KEEP_5MIN_DAYS", "KEEP_HOURLY_DAYS"}
+    assignments = {}
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*(?:export\s+)?(KEEP_[A-Z_0-9]+)\s*=(.*)$", line.rstrip("\r\n"))
+        if not match:
+            continue
+        key, expression = match.groups()
+        value = None
+        try:
+            lexer = shlex.shlex(expression, posix=True, punctuation_chars=";&|<>()")
+            lexer.whitespace_split = True
+            words = list(lexer)
+            if len(words) == 1 and not any(marker in expression for marker in ("$", "`")):
+                value = words[0]
+        except ValueError:
+            pass
+        assignments.setdefault(key, []).append((index, value))
+    by_line = {index: (key, value) for key, rows in assignments.items() for index, value in rows}
+    changed = []
+    for index, line in enumerate(lines):
+        item = by_line.get(index)
+        if item is None:
+            changed.append(line)
+            continue
+        key, value = item
+        rows = assignments.get(key, [])
+        has_dependency = any(re.search(r"\b" + re.escape(key) + r"\b", other)
+                             for pos, other in enumerate(lines) if pos not in [row[0] for row in rows])
+        if key in obsolete and value is not None and not has_dependency:
+            continue
+        if (key in old_keys and value is not None and re.fullmatch(r"0*1000", value)
+                and all(raw is not None for _, raw in rows) and not has_dependency):
+            if index == rows[-1][0] and old_keys[key] not in assignments:
+                changed.append(old_keys[key] + "=3\n")
+            continue
+        changed.append(line)
+    result = "".join(changed)
+    if result != original:
+        config_path.write_text(result)
 
 schedule = "0 3 * * 0 /opt/unifi-cleanup.sh --apply >> /var/log/unifi-cleanup.log 2>&1\n"
 output = []
@@ -218,12 +262,7 @@ replace_file() {
     mv -f -- "$2.install.$$" "$2"
 }
 restore_needed=1
-if [[ -f /etc/unifi-cleanup.conf ]]; then
-    chmod 0600 /etc/unifi-cleanup.conf
-    chown root:root /etc/unifi-cleanup.conf
-else
-    replace_file "$work_dir/unifi-cleanup.conf" /etc/unifi-cleanup.conf 0600
-fi
+replace_file "$work_dir/unifi-cleanup.conf" /etc/unifi-cleanup.conf 0600
 replace_file "$work_dir/unifi-cleanup.js" /opt/unifi-cleanup.js 0640
 replace_file "$work_dir/unifi_tune.py" /opt/unifi_tune.py 0640
 replace_file "$work_dir/install-unifi-cleanup.sh" /opt/install-unifi-cleanup.sh 0750

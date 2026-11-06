@@ -66,7 +66,7 @@ sudo bash "$unifi_cleanup_tmp/unifi-cleanup/scripts/unifi-cleanup.sh" --install
 /opt/install-unifi-cleanup.sh
 ```
 
-Буквальные `REPORT_EMAIL` и `REPORT_FROM` из прежнего скрипта переносятся в закрытый конфиг без исполнения старого файла. Существующий `/etc/unifi-cleanup.conf` сохраняет явные значения, включая сроки хранения. При ошибке переключения установщик пытается восстановить сохранённые файлы и расписание и выводит результат восстановления.
+Буквальные `REPORT_EMAIL` и `REPORT_FROM` из прежнего скрипта переносятся в закрытый конфиг без исполнения старого файла. Существующий `/etc/unifi-cleanup.conf` сохраняет явные настройки. Стандартные прежние сроки долгосрочной истории переводятся в `KEEP_*_YEARS=3`, нестандартные явные переопределения сроков сохраняются. При ошибке переключения установщик пытается восстановить сохранённые файлы и расписание и выводит результат восстановления.
 
 Откат установщика охватывает файлы обслуживания, drop-in и cron. Помощник откатывает `system.properties`, если применение ресурсов завершилось ошибкой. Успешно применённые лимиты сохраняются при последующей ошибке финальной проверки индексов.
 
@@ -122,13 +122,11 @@ UniFi при запуске может удалить добавленные и�
 
 | Коллекции | Срок по умолчанию | Параметры конфига |
 | --- | --- | --- |
-| `ace.user`, `ace.reference_name_history` | 1000 дней | `KEEP_USER_DAYS`, `KEEP_REFERENCE_DAYS` |
+| `ace.user`, `ace.reference_name_history` | 3 года | `KEEP_USER_YEARS`, `KEEP_REFERENCE_YEARS` |
 | `ace.rogue` | 180 дней | `KEEP_ROGUE_DAYS` |
-| `ace_stat.stat_5minutes` | 60 дней | `KEEP_5MIN_DAYS` |
-| `ace_stat.stat_hourly` | 180 дней | `KEEP_HOURLY_DAYS` |
-| `ace_stat.stat_daily`, `stat_monthly`, `stat_archive`, `wifi_connection_event` | 1000 дней | `KEEP_DAILY_DAYS`, `KEEP_MONTHLY_DAYS`, `KEEP_ARCHIVE_DAYS`, `KEEP_WIFI_DAYS` |
+| `ace_stat.stat_daily`, `stat_monthly`, `stat_archive`, `wifi_connection_event` | 3 года | `KEEP_DAILY_YEARS`, `KEEP_MONTHLY_YEARS`, `KEEP_ARCHIVE_YEARS`, `KEEP_WIFI_YEARS` |
 
-Тысяча дней меньше трёх календарных лет. Скрипт задаёт границы своей очистки, встроенное обслуживание UniFi может удалить историю раньше. Увеличение фактически доступной истории требует отдельной настройки UniFi и оценки ресурсов.
+Скрипт задаёт границы своей очистки, встроенное обслуживание UniFi может удалить историю раньше.
 
 Числовое время в секундах и миллисекундах, включая BSON Long, и BSON Date обрабатываются раздельно. Для `stat_*` используется `datetime`, для `wifi_connection_event` — `time`. Непригодные и отсутствующие временные значения сохраняются для отдельной проверки.
 

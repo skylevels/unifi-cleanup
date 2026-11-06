@@ -14,7 +14,7 @@ and maintains indexes and the configured UniFi memory limits.
 --install installs weekly maintenance, the startup hook and resource settings.
 Configuration is read from /etc/unifi-cleanup.conf when it exists.
 Reports are mailed only in --apply mode when REPORT_EMAIL is configured.
-Retention defaults are 1000 days, 180 days and 60 days by collection.
+Retention defaults are 3 years for history and 180 days for rogue APs.
 EOF
 }
 
@@ -73,15 +73,13 @@ MAX_PER_COLLECTION=${MAX_PER_COLLECTION:-10000}
 MAX_TOTAL=${MAX_TOTAL:-50000}
 MAX_RUNTIME_SEC=${MAX_RUNTIME_SEC:-600}
 QUERY_TIMEOUT_MS=${QUERY_TIMEOUT_MS:-5000}
-KEEP_USER_DAYS=${KEEP_USER_DAYS:-1000}
-KEEP_REFERENCE_DAYS=${KEEP_REFERENCE_DAYS:-1000}
+KEEP_USER_YEARS=${KEEP_USER_YEARS:-}
+KEEP_REFERENCE_YEARS=${KEEP_REFERENCE_YEARS:-}
 KEEP_ROGUE_DAYS=${KEEP_ROGUE_DAYS:-180}
-KEEP_5MIN_DAYS=${KEEP_5MIN_DAYS:-60}
-KEEP_HOURLY_DAYS=${KEEP_HOURLY_DAYS:-180}
-KEEP_DAILY_DAYS=${KEEP_DAILY_DAYS:-1000}
-KEEP_MONTHLY_DAYS=${KEEP_MONTHLY_DAYS:-1000}
-KEEP_ARCHIVE_DAYS=${KEEP_ARCHIVE_DAYS:-1000}
-KEEP_WIFI_DAYS=${KEEP_WIFI_DAYS:-1000}
+KEEP_DAILY_YEARS=${KEEP_DAILY_YEARS:-}
+KEEP_MONTHLY_YEARS=${KEEP_MONTHLY_YEARS:-}
+KEEP_ARCHIVE_YEARS=${KEEP_ARCHIVE_YEARS:-}
+KEEP_WIFI_YEARS=${KEEP_WIFI_YEARS:-}
 REPORT_EMAIL=${REPORT_EMAIL:-}
 REPORT_FROM=${REPORT_FROM:-}
 LOCK_FILE=${LOCK_FILE:-/run/lock/unifi-cleanup.lock}
@@ -130,9 +128,11 @@ report_file=$work_dir/report.txt
 
 write_js_config() {
 python3 -B - "$engine" "$mode" "$1" "$MONGO_PORT" "$BATCH_SIZE" "$MAX_PER_COLLECTION" \
-    "$MAX_TOTAL" "$MAX_RUNTIME_SEC" "$QUERY_TIMEOUT_MS" "$KEEP_USER_DAYS" \
-    "$KEEP_REFERENCE_DAYS" "$KEEP_ROGUE_DAYS" "$KEEP_5MIN_DAYS" "$KEEP_HOURLY_DAYS" \
-    "$KEEP_DAILY_DAYS" "$KEEP_MONTHLY_DAYS" "$KEEP_ARCHIVE_DAYS" "$KEEP_WIFI_DAYS" <<'PY'
+    "$MAX_TOTAL" "$MAX_RUNTIME_SEC" "$QUERY_TIMEOUT_MS" \
+    "$KEEP_USER_YEARS" "${KEEP_USER_DAYS:-}" "$KEEP_REFERENCE_YEARS" "${KEEP_REFERENCE_DAYS:-}" \
+    "$KEEP_DAILY_YEARS" "${KEEP_DAILY_DAYS:-}" "$KEEP_MONTHLY_YEARS" "${KEEP_MONTHLY_DAYS:-}" \
+    "$KEEP_ARCHIVE_YEARS" "${KEEP_ARCHIVE_DAYS:-}" "$KEEP_WIFI_YEARS" "${KEEP_WIFI_DAYS:-}" \
+    "$KEEP_ROGUE_DAYS" <<'PY'
 import json
 from pathlib import Path
 import re
@@ -144,18 +144,30 @@ limits = [
     ("MAX_PER_COLLECTION", 1, 1000000), ("MAX_TOTAL", 1, 5000000),
     ("MAX_RUNTIME_SEC", 1, 7200), ("QUERY_TIMEOUT_MS", 100, 60000),
 ]
-retentions = ["user", "reference_name_history", "rogue", "stat_5minutes",
-              "stat_hourly", "stat_daily", "stat_monthly", "stat_archive",
-              "wifi_connection_event"]
-limits.extend((name, 1, 3650) for name in retentions)
-values = []
-for raw, (name, minimum, maximum) in zip(sys.argv[4:], limits):
+def integer(raw, name, minimum, maximum):
     if not re.fullmatch(r"[0-9]+", raw) or not minimum <= int(raw) <= maximum:
         raise SystemExit(f"Invalid {name}, expected an integer from {minimum} to {maximum}.")
-    values.append(int(raw))
+    return int(raw)
+
+if len(sys.argv) != 23:
+    raise SystemExit("Invalid maintenance argument count.")
+values = [integer(raw, name, minimum, maximum)
+          for raw, (name, minimum, maximum) in zip(sys.argv[4:10], limits)]
+retentions = ["user", "reference_name_history", "stat_daily", "stat_monthly",
+              "stat_archive", "wifi_connection_event"]
+policies = {}
+for index, name in enumerate(retentions):
+    years, days = sys.argv[10 + index * 2:12 + index * 2]
+    if years:
+        policies[name] = {"years": integer(years, name + " years", 1, 10)}
+    elif days and integer(days, name + " legacy days", 1, 3650) != 1000:
+        policies[name] = {"days": int(days)}
+    else:
+        policies[name] = {"years": 3}
+policies["rogue"] = {"days": integer(sys.argv[22], "rogue days", 1, 3650)}
 config = dict(zip(("batchSize", "maxPerCollection", "maxTotal", "maxSeconds", "maxTimeMS"), values[1:6]))
 config["mode"] = mode
-config["retention"] = dict(zip(retentions, values[6:]))
+config["retention"] = policies
 config["javaHeapBytes"] = None
 if collect_heap == "1":
     try:

@@ -38,6 +38,20 @@ function cleanupTimeQuery(field, cutoffMs) {
     return {$or: [seconds, milliseconds, dates]};
 }
 
+function cleanupRetentionCutoff(nowMs, policy) {
+    var days = policy.years !== undefined ? policy.years * 365 : policy.days;
+    return nowMs - days * 86400000;
+}
+
+function cleanupRetentionLabel(policy) {
+    var unit = policy.years !== undefined ? "years" : "days";
+    var value = policy[unit];
+    var forms = unit === "years" ? ["год", "года", "лет"] : ["день", "дня", "дней"];
+    var last = value % 10;
+    var teens = value % 100 >= 11 && value % 100 <= 14;
+    return value + " " + forms[teens ? 2 : last === 1 ? 0 : last >= 2 && last <= 4 ? 1 : 2];
+}
+
 function cleanupUserQuery(context) {
     return {$and: [
         {name: {$exists: false}},
@@ -251,20 +265,24 @@ function runUniFiCleanup(config) {
         {database: "ace", collection: "user", field: "last_seen"},
         {database: "ace", collection: "reference_name_history", field: "delete_time"},
         {database: "ace", collection: "rogue", field: "last_seen"},
-        {database: "ace_stat", collection: "stat_5minutes", field: "datetime"},
-        {database: "ace_stat", collection: "stat_hourly", field: "datetime"},
         {database: "ace_stat", collection: "stat_daily", field: "datetime"},
         {database: "ace_stat", collection: "stat_monthly", field: "datetime"},
         {database: "ace_stat", collection: "stat_archive", field: "datetime"},
         {database: "ace_stat", collection: "wifi_connection_event", field: "time"}
     ];
+    var started = new Date().getTime();
     jobs.forEach(function(job) {
-        var days = config.retention[job.collection];
-        if (typeof days !== "number" || !isFinite(days) || days < 1 || Math.floor(days) !== days) {
+        var policy = config.retention && config.retention[job.collection];
+        var units = policy && typeof policy === "object" ? Object.keys(policy) : [];
+        var unit = units[0];
+        var amount = policy && policy[unit];
+        if (units.length !== 1 || (unit !== "days" && (unit !== "years" || job.collection === "rogue")) ||
+                typeof amount !== "number" || !isFinite(amount) || amount < 1 ||
+                amount > (unit === "years" ? 10 : 3650) || Math.floor(amount) !== amount) {
             throw new Error("Неверный срок хранения " + job.collection);
         }
+        job.cutoff = cleanupRetentionCutoff(started, policy);
     });
-    var started = new Date().getTime();
     var deadline = started + config.maxSeconds * 1000;
     var context = cleanupContext(config);
     var before = cleanupSizes();
@@ -302,7 +320,7 @@ function runUniFiCleanup(config) {
         }
         try {
             var collection = db.getSiblingDB(job.database).getCollection(job.collection);
-            var cutoff = started - config.retention[job.collection] * 86400000;
+            var cutoff = job.cutoff;
             var query = cleanupTimeQuery(job.field, cutoff);
             if (job.collection === "user") {
                 query = {$and: [query, cleanupUserQuery(context)]};
@@ -318,7 +336,7 @@ function runUniFiCleanup(config) {
                     addSite(group._id, count, label);
                 });
                 print(label + ": кандидатов=" + candidateCount + ", хранение=" +
-                      config.retention[job.collection] + " дней, поле=" + job.field);
+                      cleanupRetentionLabel(config.retention[job.collection]) + ", поле=" + job.field);
                 total += candidateCount;
                 continue;
             }
@@ -369,7 +387,7 @@ function runUniFiCleanup(config) {
                 limited = true;
             }
             print(label + ": удалено=" + deleted + ", хранение=" +
-                  config.retention[job.collection] + " дней, поле=" + job.field);
+                  cleanupRetentionLabel(config.retention[job.collection]) + ", поле=" + job.field);
         } catch (error) {
             errors += 1;
             print("ОШИБКА " + label + ": " + cleanupErrorText(error));

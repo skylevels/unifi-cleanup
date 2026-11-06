@@ -91,11 +91,53 @@ print(os.environ.get('TEST_JAVA_PID', '0'))
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.captured_config()
         self.assertEqual(config['mode'], 'dry-run')
-        self.assertEqual(config['retention']['user'], 1000)
-        self.assertEqual(config['retention']['stat_hourly'], 180)
-        self.assertEqual(config['retention']['stat_5minutes'], 60)
+        self.assertEqual(config['retention'], {
+            'user': {'years': 3}, 'reference_name_history': {'years': 3},
+            'rogue': {'days': 180}, 'stat_daily': {'years': 3},
+            'stat_monthly': {'years': 3}, 'stat_archive': {'years': 3},
+            'wifi_connection_event': {'years': 3},
+        })
         self.assertFalse(Path(self.env['TEST_MAIL']).exists())
         self.assertFalse(list(self.work.glob('unifi-cleanup.*')))
+
+    def test_legacy_default_configuration_uses_three_year_policy(self):
+        self.config.write_text('\n'.join('KEEP_' + name + '_DAYS=1000' for name in
+                               ('USER', 'REFERENCE', 'DAILY', 'MONTHLY', 'ARCHIVE', 'WIFI')) +
+                               '\nKEEP_5MIN_DAYS=unused\nKEEP_HOURLY_DAYS=unused\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retention = self.captured_config()['retention']
+        self.assertEqual(set(retention), {'user', 'reference_name_history', 'rogue', 'stat_daily',
+                                        'stat_monthly', 'stat_archive', 'wifi_connection_event'})
+        self.assertTrue(all(policy == {'years': 3} for name, policy in retention.items() if name != 'rogue'))
+
+    def test_retention_arguments_keep_their_collection_and_unit(self):
+        self.config.write_text('KEEP_USER_YEARS=1\nKEEP_REFERENCE_YEARS=2\nKEEP_DAILY_YEARS=3\n'
+                               'KEEP_MONTHLY_YEARS=4\nKEEP_ARCHIVE_YEARS=5\nKEEP_WIFI_YEARS=6\n'
+                               'KEEP_ROGUE_DAYS=181\nKEEP_USER_DAYS=1000\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.captured_config()['retention'], {
+            'user': {'years': 1}, 'reference_name_history': {'years': 2},
+            'stat_daily': {'years': 3}, 'stat_monthly': {'years': 4},
+            'stat_archive': {'years': 5}, 'wifi_connection_event': {'years': 6},
+            'rogue': {'days': 181},
+        })
+
+    def test_custom_legacy_days_are_preserved_and_explicit_years_take_precedence(self):
+        self.config.write_text('KEEP_USER_DAYS=730\nKEEP_REFERENCE_DAYS=900\nKEEP_REFERENCE_YEARS=4\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retention = self.captured_config()['retention']
+        self.assertEqual(retention['user'], {'days': 730})
+        self.assertEqual(retention['reference_name_history'], {'years': 4})
+
+    def test_invalid_years_stop_before_database_execution(self):
+        for value in ('0', '11', 'invalid'):
+            with self.subTest(value=value):
+                result = self.run_wrapper('--apply', KEEP_USER_YEARS=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(Path(self.env['TEST_CONFIG']).exists())
 
     def test_apply_reports_success_and_submits_only_fake_mail(self):
         result = self.run_wrapper('--apply', FAKE_STATUS='OK', REPORT_EMAIL='ops@example.org')
@@ -236,7 +278,68 @@ class UniFiCleanupInstallerCase(unittest.TestCase):
         self.assertIn('0 3 * * 0 /opt/unifi-cleanup.sh --apply', cron)
         self.assertIn('0 5 * * * /opt/other-maintenance.sh\n', cron)
         self.assertIn('REPORT_EMAIL=ops@example.org', self.config.read_text())
-        self.assertIn('KEEP_USER_DAYS=1000', self.config.read_text())
+        self.assertIn('KEEP_USER_YEARS=3', self.config.read_text())
+        self.assertIn('KEEP_ROGUE_DAYS=180', self.config.read_text())
+        self.assertNotIn('KEEP_5MIN_DAYS', self.config.read_text())
+        self.assertNotIn('KEEP_HOURLY_DAYS', self.config.read_text())
+
+    def test_migrates_previous_default_retention_without_changing_other_settings(self):
+        self.config.write_text('# Local settings\nREPORT_EMAIL=custom@example.org\nBATCH_SIZE=70\n' +
+                               '\n'.join('KEEP_' + name + '_DAYS=1000' for name in
+                               ('USER', 'REFERENCE', 'DAILY', 'MONTHLY', 'ARCHIVE', 'WIFI')) +
+                               '\nKEEP_ROGUE_DAYS=181\nKEEP_5MIN_DAYS=60\nKEEP_HOURLY_DAYS=180\n')
+        self.cron.write_text('')
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.config.read_text()
+        self.assertIn('# Local settings\nREPORT_EMAIL=custom@example.org\nBATCH_SIZE=70\n', config)
+        for name in ('USER', 'REFERENCE', 'DAILY', 'MONTHLY', 'ARCHIVE', 'WIFI'):
+            self.assertIn('KEEP_' + name + '_YEARS=3\n', config)
+            self.assertNotIn('KEEP_' + name + '_DAYS=', config)
+        self.assertIn('KEEP_ROGUE_DAYS=181\n', config)
+        self.assertNotIn('KEEP_5MIN_DAYS', config)
+        self.assertNotIn('KEEP_HOURLY_DAYS', config)
+
+    def test_migration_preserves_custom_days_and_existing_years(self):
+        self.config.write_text('REPORT_EMAIL=custom@example.org\nKEEP_USER_DAYS=730\n'
+                               'KEEP_REFERENCE_DAYS=1000\nKEEP_REFERENCE_YEARS=4\n')
+        self.cron.write_text('')
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('KEEP_USER_DAYS=730\n', self.config.read_text())
+        self.assertNotIn('KEEP_USER_YEARS=', self.config.read_text())
+        self.assertIn('KEEP_REFERENCE_YEARS=4\n', self.config.read_text())
+        self.assertNotIn('KEEP_REFERENCE_DAYS=', self.config.read_text())
+
+    def test_migration_respects_last_literal_assignment(self):
+        self.config.write_text('KEEP_USER_DAYS=1000\nKEEP_USER_DAYS=730\n'
+                               'KEEP_REFERENCE_DAYS=730\nKEEP_REFERENCE_DAYS=1000\n')
+        self.cron.write_text('')
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.config.read_text(), 'KEEP_USER_DAYS=730\nKEEP_REFERENCE_DAYS=730\n'
+                                                'KEEP_REFERENCE_YEARS=3\n')
+
+    def test_migration_does_not_execute_or_rewrite_dependent_shell_logic(self):
+        touched = self.work / 'should-not-exist'
+        original = ('KEEP_USER_DAYS=1000\n'
+                    'KEEP_USER_YEARS=$((KEEP_USER_DAYS / 365))\n'
+                    'KEEP_REFERENCE_DAYS=$(touch ' + str(touched) + ')\n')
+        self.config.write_text(original)
+        self.cron.write_text('')
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(touched.exists())
+        self.assertEqual(self.config.read_text(), original)
+
+    def test_migration_keeps_obsolete_variables_used_by_other_configuration(self):
+        original = ('KEEP_5MIN_DAYS=60\nKEEP_HOURLY_DAYS=180\n'
+                    'MAX_TOTAL=$((KEEP_HOURLY_DAYS * 20))\nMAX_RUNTIME_SEC=$KEEP_5MIN_DAYS\n')
+        self.config.write_text(original)
+        self.cron.write_text('')
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.config.read_text(), original)
 
     def test_existing_configuration_is_preserved_exactly(self):
         self.config.write_text('REPORT_EMAIL=custom@example.org\nKEEP_USER_DAYS=730\n')
